@@ -59,49 +59,90 @@ def getFiles(workingdir):
     return fileDict
 
 
-def linkSearch(text):
+def linkSearch(data):
     """
     Search for URLs using a regex.
     Matches protocols like ftp, hxxp (commonly used in obfuscation), etc.
+    Works with both bytes and string data.
     """
-    url_regex = re.compile(
-        r'(?:ftp|hxxp)[s]?://(?:[a-zA-Z0-9\$\-_@.&+]|[!*$$$$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-        re.I
-    )
-    urls = list(set(url_regex.findall(text)))
+    if isinstance(data, bytes):
+        url_regex = re.compile(
+            rb'(?:ftp|hxxp)[s]?://(?:[a-zA-Z0-9\$\-_@.&+]|[!*$$$$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+            re.I
+        )
+        urls = [url.decode('utf-8', errors='ignore') for url in set(url_regex.findall(data))]
+    else:
+        url_regex = re.compile(
+            r'(?:ftp|hxxp)[s]?://(?:[a-zA-Z0-9\$\-_@.&+]|[!*$$$$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+            re.I
+        )
+        urls = list(set(url_regex.findall(data)))
     return urls
 
 
 def getStrings(filename):
     """
-    Extract printable strings from a file. Both ASCII and wide/Unicode strings
-    are extracted. Also appends any URLs found in the file.
+    Extract printable strings from a file using multiple methods.
     """
     try:
         with open(filename, 'rb') as f:
             data = f.read()
-        # Regular expression for ASCII strings.
-        chars = r"A-Za-z0-9/\-:.,_$%@'()\\\{\};\]$$<> "
-        regexp = r'[{0}]{{6,100}}'.format(chars)
-        pattern = re.compile(regexp)
-        strlist = pattern.findall(data)
-
-        # Extract wide (Unicode) strings.
-        unicode_pattern = re.compile(r'(?:[\x20-\x7E]\x00){6,100}')
-        unicodelist = unicode_pattern.findall(data)
-
-        allstrings = unicodelist + strlist
-
-        # Check and add URLs if present.
+        
+        allstrings = []
+        
+        # Method 1: Extract ASCII strings
+        ascii_pattern = re.compile(rb'[\x20-\x7E]{6,100}')
+        ascii_matches = ascii_pattern.findall(data)
+        for match in ascii_matches:
+            try:
+                decoded = match.decode('ascii')
+                allstrings.append(decoded)
+            except:
+                pass
+        
+        # Method 2: Extract UTF-16LE strings (common in Windows executables)
+        utf16_pattern = re.compile(rb'(?:[\x20-\x7E]\x00){6,100}')
+        utf16_matches = utf16_pattern.findall(data)
+        for match in utf16_matches:
+            try:
+                decoded = match.decode('utf-16le').replace('\x00', '')
+                if decoded.strip():
+                    allstrings.append(decoded)
+            except:
+                pass
+        
+        # Method 3: Extract UTF-8 strings
+        utf8_pattern = re.compile(rb'[\x20-\x7E\xC0-\xFF]{6,100}')
+        utf8_matches = utf8_pattern.findall(data)
+        for match in utf8_matches:
+            try:
+                decoded = match.decode('utf-8')
+                # Only add if it contains meaningful characters
+                if re.search(r'[A-Za-z]', decoded):
+                    allstrings.append(decoded)
+            except:
+                pass
+        
+        # Method 4: Look for URLs
         urls = linkSearch(data)
         if urls:
             allstrings.extend(urls)
-
-        if allstrings:
-            return list(set(allstrings))
+        
+        # Remove duplicates and filter
+        unique_strings = []
+        seen = set()
+        for s in allstrings:
+            s_clean = s.strip()
+            if s_clean and s_clean not in seen and len(s_clean) >= 4:
+                unique_strings.append(s_clean)
+                seen.add(s_clean)
+        
+        if unique_strings:
+            return unique_strings
         else:
             print(f"[!] No Extractable Attributes Present in Hash: {md5sum(filename)}. Please remove it from the sample set and try again!")
             sys.exit(1)
+            
     except Exception as e:
         print(f"[!] Error extracting strings from file {filename}: {e}")
         sys.exit(1)
@@ -262,27 +303,34 @@ def findCommonStrings(fileDict, filetype):
 def buildYara(options, strings, hashes):
     """
     Construct the YARA rule from the extracted strings and file hashes.
-    The rule includes metadata (author, date, description, file hashes) and a series of
-    string declarations. The condition is set as either "any of them" (for emails)
-    or a specified number of strings.
     """
     date = datetime.now().strftime("%Y-%m-%d")
     randStrings = []
-    try:
-        for i in range(1, 20):
-            randStrings.append(random.choice(strings))
-    except IndexError:
+    
+    # Select up to 19 random strings
+    num_strings = min(19, len(strings))
+    if num_strings == 0:
         print('[!] No Common Attributes Found For All Samples, Please be more selective')
         sys.exit(1)
-
+    
+    randStrings = random.sample(strings, num_strings)
+    
     # Prioritize additional signature material for emails
     if options.FileType.lower() == 'email':
         for s in strings:
-            if "@" in s or "." in s:
+            if ("@" in s or "." in s) and s not in randStrings:
                 randStrings.append(s)
+                if len(randStrings) >= 25:  # Limit total strings
+                    break
 
-    # Remove duplicates.
-    randStrings = list(set(randStrings))
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_randStrings = []
+    for s in randStrings:
+        if s not in seen:
+            unique_randStrings.append(s)
+            seen.add(s)
+    randStrings = unique_randStrings
 
     rule_filename = options.RuleName + ".yar"
     with open(rule_filename, "w") as ruleOutFile:
@@ -299,19 +347,26 @@ def buildYara(options, strings, hashes):
         ruleOutFile.write(f"\tsample_filetype = \"{options.FileType}\"\n")
         ruleOutFile.write("\tyaragenerator = \"https://github.com/Dgg475/\"\n")
         ruleOutFile.write("strings:\n")
-        for s in randStrings:
-            # If a string contains null bytes, output it as wide.
+        
+        for i, s in enumerate(randStrings):
+            # Clean the string for YARA
+            if isinstance(s, bytes):
+                s = s.decode('utf-8', errors='ignore')
+            
+            # If a string contains null bytes, output it as wide
             if "\x00" in s:
                 cleaned = s.replace("\\", "\\\\").replace('"', '\\"').replace("\x00", "")
-                ruleOutFile.write(f"\t$string{randStrings.index(s)} = \"{cleaned}\" wide\n")
+                ruleOutFile.write(f"\t$string{i} = \"{cleaned}\" wide\n")
             else:
                 cleaned = s.replace("\\", "\\\\").replace('"', '\\"')
-                ruleOutFile.write(f"\t$string{randStrings.index(s)} = \"{cleaned}\"\n")
+                ruleOutFile.write(f"\t$string{i} = \"{cleaned}\"\n")
+                
         ruleOutFile.write("condition:\n")
         if options.FileType.lower() == "email":
             ruleOutFile.write("\tany of them\n")
         else:
-            ruleOutFile.write(f"\t{len(randStrings) - 1} of them\n")
+            condition_count = max(1, len(randStrings) - 1)
+            ruleOutFile.write(f"\t{condition_count} of them\n")
         ruleOutFile.write("}\n")
     return
 
