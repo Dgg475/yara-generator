@@ -41,5 +41,6 @@ InputDirectory: Path to the directory containing the sample files.
 
 example: 
 ```
-python3 full_yara_generator.py /path/to/your/sample/files -r MyYaraRule -f exe -a "Your Name" -d "This rule detects a specific malware" -t malware,exe -v
+python3 yarafull.py samples -r Myrule3 -f exe -a "Mino761" -d "test" -t malware,exe -v
+
 ```
